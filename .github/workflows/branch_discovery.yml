@@ -1,0 +1,190 @@
+
+name: DBT Branch Discovery
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # Every Monday at 03:00 UTC
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  discover:
+    name: Discover old feature branches
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Discover branch candidates
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const baseBranch = 'main';
+            const retentionDays = 30;
+            const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+
+            const branches = await github.paginate(
+              github.rest.repos.listBranches,
+              { owner, repo, per_page: 100 }
+            );
+
+            const report = [];
+
+            for (const branch of branches) {
+              const name = branch.name;
+
+              if (!name.startsWith('feat/')) continue;
+
+              const commitDate =
+                branch.commit.commit.committer?.date ||
+                branch.commit.commit.author?.date;
+
+              const ageDays = commitDate
+                ? Math.floor((Date.now() - new Date(commitDate).getTime()) / 86400000)
+                : null;
+
+              const reasons = [];
+
+              if (ageDays === null || new Date(commitDate).getTime() > cutoff) {
+                reasons.push('Younger than 30 days or commit date unavailable');
+              }
+
+              if (branch.protected) {
+                reasons.push('Protected branch');
+              }
+
+              const prs = await github.paginate(
+                github.rest.pulls.list,
+                {
+                  owner,
+                  repo,
+                  state: 'all',
+                  head: `${owner}:${name}`,
+                  per_page: 100
+                }
+              );
+
+              const openPRs = prs.filter(pr => pr.state === 'open');
+
+              const mergedIntoMain = prs.some(
+                pr => pr.merged_at && pr.base.ref === baseBranch
+              );
+
+              if (openPRs.length > 0) {
+                reasons.push('Open pull request exists');
+              }
+
+              if (!mergedIntoMain) {
+                reasons.push('No merged PR into main found');
+              }
+
+              // Conservative check: branch must have no commits ahead of main.
+              // This may exclude squash-merged branches; review those separately.
+              if (mergedIntoMain) {
+                try {
+                  const comparison = await github.rest.repos.compareCommitsWithBasehead({
+                    owner,
+                    repo,
+                    basehead: `${baseBranch}...${name}`
+                  });
+
+                  if (comparison.ahead_by > 0) {
+                    reasons.push('Branch contains commits not present in main');
+                  }
+                } catch (error) {
+                  reasons.push('Could not compare branch with main');
+                }
+              }
+
+              const basicChecksPassed = reasons.length === 0;
+
+              report.push({
+                branch: name,
+                lastCommit: commitDate || 'Unknown',
+                ageDays: ageDays ?? 'Unknown',
+                protected: branch.protected,
+                mergedIntoMain,
+                openPRCount: openPRs.length,
+                basicChecks: basicChecksPassed ? 'PASSED' : 'EXCLUDED',
+                deploymentVerification: 'PENDING',
+                result: basicChecksPassed
+                  ? 'REQUIRES_DEPLOYMENT_VERIFICATION'
+                  : 'EXCLUDED',
+                reasons: reasons.join('; ') || 'Basic checks passed'
+              });
+            }
+
+            const headers = [
+              'Branch',
+              'Last Commit',
+              'Age (Days)',
+              'Protected',
+              'Merged Into Main',
+              'Open PRs',
+              'Basic Checks',
+              'Deployment Verification',
+              'Result',
+              'Reasons'
+            ];
+
+            const escapeCSV = value =>
+              `"${String(value).replace(/"/g, '""')}"`;
+
+            const rows = report.map(item => [
+              item.branch,
+              item.lastCommit,
+              item.ageDays,
+              item.protected,
+              item.mergedIntoMain,
+              item.openPRCount,
+              item.basicChecks,
+              item.deploymentVerification,
+              item.result,
+              item.reasons
+            ].map(escapeCSV).join(','));
+
+            fs.writeFileSync(
+              'branch-discovery-report.csv',
+              [headers.join(','), ...rows].join('\n')
+            );
+
+            fs.writeFileSync(
+              'branch-discovery-report.json',
+              JSON.stringify(report, null, 2)
+            );
+
+            await core.summary
+              .addHeading('DBT Branch Discovery Report')
+              .addTable([
+                headers.map(header => ({ data: header, header: true })),
+                ...report.map(item => [
+                  item.branch,
+                  item.lastCommit,
+                  String(item.ageDays),
+                  String(item.protected),
+                  String(item.mergedIntoMain),
+                  String(item.openPRCount),
+                  item.basicChecks,
+                  item.deploymentVerification,
+                  item.result,
+                  item.reasons
+                ])
+              ])
+              .write();
+
+            core.info(`Inspected ${report.length} feature branches.`);
+
+      - name: Upload discovery reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-branch-discovery-report
+          path: |
+            branch-discovery-report.csv
+            branch-discovery-report.json
+          if-no-files-found: error
+          retention-days: 90
