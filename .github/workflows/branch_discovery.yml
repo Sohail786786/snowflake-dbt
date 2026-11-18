@@ -1,22 +1,18 @@
 
 name: DBT Branch Discovery
 
-
 on:
+  # Temporary trigger for testing in your personal fork.
   push:
     branches:
       - feat/test-cleanup-1
 
+  # Allows manual execution.
   workflow_dispatch:
 
+  # Every Monday at 03:00 UTC.
   schedule:
     - cron: "0 3 * * 1"
-
-    
-#on:
-# workflow_dispatch:
-#  schedule:
-#   - cron: "0 3 * * 1" # Every Monday at 03:00 UTC
 
 permissions:
   contents: read
@@ -58,11 +54,26 @@ jobs:
 
               const reasons = [];
 
-              // Get the most recent commit date.
-              const commitDate =
-                branch.commit.commit.committer?.date ||
-                branch.commit.commit.author?.date ||
-                null;
+              // Retrieve the latest commit details.
+              let commitDate = null;
+
+              try {
+                const commitDetails = await github.rest.repos.getCommit({
+                  owner,
+                  repo,
+                  ref: branch.commit.sha
+                });
+
+                commitDate =
+                  commitDetails.data.commit.committer?.date ||
+                  commitDetails.data.commit.author?.date ||
+                  null;
+
+              } catch (error) {
+                core.warning(
+                  `Could not retrieve commit details for ${name}: ${error.message}`
+                );
+              }
 
               const commitTimestamp = commitDate
                 ? new Date(commitDate).getTime()
@@ -78,7 +89,9 @@ jobs:
               if (!validCommitDate) {
                 reasons.push('Last commit date unavailable or invalid');
               } else if (commitTimestamp > cutoff) {
-                reasons.push(`Branch is younger than ${retentionDays} days`);
+                reasons.push(
+                  `Branch is younger than ${retentionDays} days`
+                );
               }
 
               // Check branch protection.
@@ -98,7 +111,9 @@ jobs:
                 }
               );
 
-              const openPRs = prs.filter(pr => pr.state === 'open');
+              const openPRs = prs.filter(
+                pr => pr.state === 'open'
+              );
 
               const mergedIntoMain = prs.some(
                 pr => pr.merged_at && pr.base.ref === baseBranch
@@ -109,10 +124,13 @@ jobs:
               }
 
               if (!mergedIntoMain) {
-                reasons.push('No merged pull request into main found');
+                reasons.push(
+                  'No merged pull request into main found'
+                );
               }
 
-              // Conservative check for commits not present in main.
+              // Check whether the branch contains commits
+              // that are not present in main.
               let comparisonStatus = 'NOT_CHECKED';
 
               if (mergedIntoMain) {
@@ -124,17 +142,22 @@ jobs:
                       basehead: `${baseBranch}...${name}`
                     });
 
-                  if (comparison.ahead_by > 0) {
+                  if (comparison.data.ahead_by > 0) {
                     comparisonStatus = 'REVIEW_REQUIRED';
+
                     reasons.push(
                       'Branch contains commits not found in main; manual review required'
                     );
                   } else {
                     comparisonStatus = 'PASSED';
                   }
+
                 } catch (error) {
                   comparisonStatus = 'ERROR';
-                  reasons.push('Could not compare branch with main');
+
+                  reasons.push(
+                    'Could not compare branch with main'
+                  );
 
                   core.warning(
                     `Comparison failed for ${name}: ${error.message}`
@@ -152,7 +175,9 @@ jobs:
                 mergedIntoMain,
                 openPRCount: openPRs.length,
                 comparisonStatus,
-                basicChecks: basicChecksPassed ? 'PASSED' : 'EXCLUDED',
+                basicChecks: basicChecksPassed
+                  ? 'PASSED'
+                  : 'EXCLUDED',
                 deploymentVerification: 'NOT_CHECKED',
                 result: basicChecksPassed
                   ? 'BASIC_CHECKS_PASSED_PENDING_DEPLOYMENT_VERIFICATION'
@@ -195,7 +220,10 @@ jobs:
 
             fs.writeFileSync(
               'branch-discovery-report.csv',
-              [headers.map(escapeCSV).join(','), ...rows].join('\n')
+              [
+                headers.map(escapeCSV).join(','),
+                ...rows
+              ].join('\n')
             );
 
             fs.writeFileSync(
@@ -229,17 +257,23 @@ jobs:
                 })),
                 ...summaryRows
               ])
-              .addRaw(`\nInspected ${report.length} feature branches.`)
+              .addRaw(
+                `\nInspected ${report.length} feature branches.`
+              )
               .write();
 
             const basicChecksPassedCount = report.filter(
               item => item.basicChecks === 'PASSED'
             ).length;
 
-            core.info(`Inspected ${report.length} feature branches.`);
+            core.info(
+              `Inspected ${report.length} feature branches.`
+            );
+
             core.info(
               `Passed basic checks: ${basicChecksPassedCount}`
             );
+
             core.info('No branches were deleted.');
 
       - name: Upload discovery reports
