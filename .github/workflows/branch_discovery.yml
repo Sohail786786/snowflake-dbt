@@ -26,8 +26,11 @@ jobs:
             const repo = context.repo.repo;
             const baseBranch = 'main';
             const retentionDays = 30;
-            const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+            const now = Date.now();
+            const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
+            const cutoff = now - retentionMs;
 
+            // Fetch all remote branches.
             const branches = await github.paginate(
               github.rest.repos.listBranches,
               { owner, repo, per_page: 100 }
@@ -38,26 +41,40 @@ jobs:
             for (const branch of branches) {
               const name = branch.name;
 
+              // Only inspect feature branches.
               if (!name.startsWith('feat/')) continue;
-
-              const commitDate =
-                branch.commit.commit.committer?.date ||
-                branch.commit.commit.author?.date;
-
-              const ageDays = commitDate
-                ? Math.floor((Date.now() - new Date(commitDate).getTime()) / 86400000)
-                : null;
 
               const reasons = [];
 
-              if (ageDays === null || new Date(commitDate).getTime() > cutoff) {
-                reasons.push('Younger than 30 days or commit date unavailable');
+              // Get the most recent commit date.
+              const commitDate =
+                branch.commit.commit.committer?.date ||
+                branch.commit.commit.author?.date ||
+                null;
+
+              const commitTimestamp = commitDate
+                ? new Date(commitDate).getTime()
+                : NaN;
+
+              const validCommitDate = Number.isFinite(commitTimestamp);
+
+              const ageDays = validCommitDate
+                ? Math.floor((now - commitTimestamp) / 86400000)
+                : null;
+
+              // Check branch inactivity.
+              if (!validCommitDate) {
+                reasons.push('Last commit date unavailable or invalid');
+              } else if (commitTimestamp > cutoff) {
+                reasons.push(`Branch is younger than ${retentionDays} days`);
               }
 
+              // Check branch protection.
               if (branch.protected) {
-                reasons.push('Protected branch');
+                reasons.push('Branch is protected');
               }
 
+              // Find pull requests originating from this branch.
               const prs = await github.paginate(
                 github.rest.pulls.list,
                 {
@@ -80,24 +97,35 @@ jobs:
               }
 
               if (!mergedIntoMain) {
-                reasons.push('No merged PR into main found');
+                reasons.push('No merged pull request into main found');
               }
 
-              // Conservative check: branch must have no commits ahead of main.
-              // This may exclude squash-merged branches; review those separately.
+              // Conservative check for commits not present in main.
+              let comparisonStatus = 'NOT_CHECKED';
+
               if (mergedIntoMain) {
                 try {
-                  const comparison = await github.rest.repos.compareCommitsWithBasehead({
-                    owner,
-                    repo,
-                    basehead: `${baseBranch}...${name}`
-                  });
+                  const comparison =
+                    await github.rest.repos.compareCommitsWithBasehead({
+                      owner,
+                      repo,
+                      basehead: `${baseBranch}...${name}`
+                    });
 
                   if (comparison.ahead_by > 0) {
-                    reasons.push('Branch contains commits not present in main');
+                    comparisonStatus = 'REVIEW_REQUIRED';
+                    reasons.push(
+                      'Branch contains commits not found in main; manual review required'
+                    );
+                  } else {
+                    comparisonStatus = 'PASSED';
                   }
                 } catch (error) {
+                  comparisonStatus = 'ERROR';
                   reasons.push('Could not compare branch with main');
+                  core.warning(
+                    `Comparison failed for ${name}: ${error.message}`
+                  );
                 }
               }
 
@@ -110,15 +138,17 @@ jobs:
                 protected: branch.protected,
                 mergedIntoMain,
                 openPRCount: openPRs.length,
+                comparisonStatus,
                 basicChecks: basicChecksPassed ? 'PASSED' : 'EXCLUDED',
-                deploymentVerification: 'PENDING',
+                deploymentVerification: 'NOT_CHECKED',
                 result: basicChecksPassed
-                  ? 'REQUIRES_DEPLOYMENT_VERIFICATION'
-                  : 'EXCLUDED',
+                  ? 'BASIC_CHECKS_PASSED_PENDING_DEPLOYMENT_VERIFICATION'
+                  : 'NOT_ELIGIBLE',
                 reasons: reasons.join('; ') || 'Basic checks passed'
               });
             }
 
+            // Generate CSV and JSON reports.
             const headers = [
               'Branch',
               'Last Commit',
@@ -126,6 +156,7 @@ jobs:
               'Protected',
               'Merged Into Main',
               'Open PRs',
+              'Comparison',
               'Basic Checks',
               'Deployment Verification',
               'Result',
@@ -142,6 +173,7 @@ jobs:
               item.protected,
               item.mergedIntoMain,
               item.openPRCount,
+              item.comparisonStatus,
               item.basicChecks,
               item.deploymentVerification,
               item.result,
@@ -150,7 +182,7 @@ jobs:
 
             fs.writeFileSync(
               'branch-discovery-report.csv',
-              [headers.join(','), ...rows].join('\n')
+              [headers.map(escapeCSV).join(','), ...rows].join('\n')
             );
 
             fs.writeFileSync(
@@ -158,26 +190,40 @@ jobs:
               JSON.stringify(report, null, 2)
             );
 
+            // Create GitHub Actions summary.
+            const summaryRows = report.map(item => [
+              item.branch,
+              String(item.ageDays),
+              String(item.protected),
+              String(item.mergedIntoMain),
+              String(item.openPRCount),
+              item.comparisonStatus,
+              item.basicChecks,
+              item.deploymentVerification,
+              item.result,
+              item.reasons
+            ]);
+
             await core.summary
               .addHeading('DBT Branch Discovery Report')
+              .addRaw(`Retention policy: ${retentionDays} days since last commit`)
               .addTable([
-                headers.map(header => ({ data: header, header: true })),
-                ...report.map(item => [
-                  item.branch,
-                  item.lastCommit,
-                  String(item.ageDays),
-                  String(item.protected),
-                  String(item.mergedIntoMain),
-                  String(item.openPRCount),
-                  item.basicChecks,
-                  item.deploymentVerification,
-                  item.result,
-                  item.reasons
-                ])
+                headers.map(header => ({
+                  data: header,
+                  header: true
+                })),
+                ...summaryRows
               ])
+              .addRaw(`\nInspected ${report.length} feature branches.`)
               .write();
 
+            const eligibleCount = report.filter(
+              item => item.basicChecks === 'PASSED'
+            ).length;
+
             core.info(`Inspected ${report.length} feature branches.`);
+            core.info(`Passed basic checks: ${eligibleCount}`);
+            core.info('No branches were deleted.');
 
       - name: Upload discovery reports
         uses: actions/upload-artifact@v4
