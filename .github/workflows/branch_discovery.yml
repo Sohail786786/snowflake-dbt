@@ -1,10 +1,22 @@
 
 name: DBT Branch Discovery
 
+
 on:
+  push:
+    branches:
+      - feat/test-cleanup-1
+
   workflow_dispatch:
+
   schedule:
-    - cron: "0 3 * * 1" # Every Monday at 03:00 UTC
+    - cron: "0 3 * * 1"
+
+    
+#on:
+# workflow_dispatch:
+#  schedule:
+#   - cron: "0 3 * * 1" # Every Monday at 03:00 UTC
 
 permissions:
   contents: read
@@ -123,6 +135,7 @@ jobs:
                 } catch (error) {
                   comparisonStatus = 'ERROR';
                   reasons.push('Could not compare branch with main');
+
                   core.warning(
                     `Comparison failed for ${name}: ${error.message}`
                   );
@@ -206,7 +219,9 @@ jobs:
 
             await core.summary
               .addHeading('DBT Branch Discovery Report')
-              .addRaw(`Retention policy: ${retentionDays} days since last commit`)
+              .addRaw(
+                `Retention policy: ${retentionDays} days since last commit`
+              )
               .addTable([
                 headers.map(header => ({
                   data: header,
@@ -217,12 +232,14 @@ jobs:
               .addRaw(`\nInspected ${report.length} feature branches.`)
               .write();
 
-            const eligibleCount = report.filter(
+            const basicChecksPassedCount = report.filter(
               item => item.basicChecks === 'PASSED'
             ).length;
 
             core.info(`Inspected ${report.length} feature branches.`);
-            core.info(`Passed basic checks: ${eligibleCount}`);
+            core.info(
+              `Passed basic checks: ${basicChecksPassedCount}`
+            );
             core.info('No branches were deleted.');
 
       - name: Upload discovery reports
