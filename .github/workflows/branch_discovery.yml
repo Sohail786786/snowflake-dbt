@@ -234,6 +234,7 @@ jobs:
             // Create GitHub Actions summary.
             const summaryRows = report.map(item => [
               item.branch,
+              item.lastCommit,
               String(item.ageDays),
               String(item.protected),
               String(item.mergedIntoMain),
@@ -243,7 +244,7 @@ jobs:
               item.deploymentVerification,
               item.result,
               item.reasons
-            ]);
+              ]);
 
             await core.summary
               .addHeading('DBT Branch Discovery Report')
