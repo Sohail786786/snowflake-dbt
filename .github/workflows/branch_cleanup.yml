@@ -1,19 +1,25 @@
 name: DBT Branch Cleanup
 
 on:
-  # Temporary testing trigger in your personal fork.
+  # TEMPORARY: testing trigger for the personal fork.
+  # Runs discovery + HTML report only. It never reaches the cleanup phase.
+  # Remove this block before using the workflow in the real repo.
   push:
     branches:
       - feat/test-cleanup-1
 
-  # Manual execution. Cleanup is disabled by default.
+  # Manual run. retention_days is a string on purpose: a number input of 0
+  # would be treated as "false" by `||` and silently replaced by 30.
   workflow_dispatch:
     inputs:
-      run_cleanup:
-        description: "Run Phase 2 cleanup after discovery"
-        required: true
+      retention_days:
+        description: "Minimum days since last commit (use 0 only when testing)"
+        type: string
+        default: "30"
+      request_cleanup:
+        description: "Ask DevOps for approval to delete after discovery"
         type: boolean
-        default: false
+        default: true
 
   # Every Monday at 03:00 UTC (08:30 AM IST).
   schedule:
@@ -25,10 +31,11 @@ permissions:
 
 jobs:
   # =====================================================
-  # PHASE 1: DISCOVER CANDIDATE BRANCHES
+  # PHASE 1: DISCOVER OLD BRANCHES + HTML REPORT
+  # The report exists BEFORE approval, so DevOps can review it.
   # =====================================================
-  discover_candidates:
-    name: Phase 1 - Discover Candidates
+  discover:
+    name: Phase 1 - Discover and report
     runs-on: ubuntu-latest
     outputs:
       candidate_count: ${{ steps.discovery.outputs.candidate_count }}
@@ -40,288 +47,68 @@ jobs:
       - name: Discover old feature branches
         id: discovery
         uses: actions/github-script@v7
+        env:
+          RETENTION_DAYS: ${{ inputs.retention_days || '30' }}
         with:
           script: |
-            const fs = require('fs');
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const baseBranch = 'main';
-            const retentionDays = 30;
-            const now = Date.now();
-            const cutoff = now - retentionDays * 86400000;
+            await require('./scripts/branch-cleanup-lib.js')
+              .discover({ github, context, core });
 
-            const branches = await github.paginate(
-              github.rest.repos.listBranches,
-              { owner, repo, per_page: 100 }
-            );
+      - name: Build HTML discovery report
+        run: >-
+          node scripts/render-report.js discovery
+          branch-report-data.json
+          scripts/branch-cleanup-final-report.html
+          branch-discovery-report.html
 
-            const report = [];
-
-            for (const branch of branches) {
-              const name = branch.name;
-              if (!name.startsWith('feat/')) continue;
-
-              const reasons = [];
-              let commitDate = null;
-
-              try {
-                const commitDetails = await github.rest.repos.getCommit({
-                  owner,
-                  repo,
-                  ref: branch.commit.sha
-                });
-                commitDate =
-                  commitDetails.data.commit.committer?.date ||
-                  commitDetails.data.commit.author?.date ||
-                  null;
-              } catch (error) {
-                core.warning(`Commit lookup failed for ${name}: ${error.message}`);
-              }
-
-              const timestamp = commitDate ? new Date(commitDate).getTime() : NaN;
-              const validDate = Number.isFinite(timestamp);
-              const ageDays = validDate
-                ? Math.floor((now - timestamp) / 86400000)
-                : null;
-
-              if (!validDate) {
-                reasons.push('Last commit date unavailable');
-              } else if (timestamp > cutoff) {
-                reasons.push(`Branch is younger than ${retentionDays} days`);
-              }
-
-              if (branch.protected) reasons.push('Branch is protected');
-
-              const prs = await github.paginate(github.rest.pulls.list, {
-                owner,
-                repo,
-                state: 'all',
-                head: `${owner}:${name}`,
-                per_page: 100
-              });
-
-              const openPRs = prs.filter(pr => pr.state === 'open');
-              const mergedIntoMain = prs.some(
-                pr => pr.merged_at && pr.base.ref === baseBranch
-              );
-
-              if (openPRs.length) reasons.push('Open pull request exists');
-              if (!mergedIntoMain) reasons.push('No merged pull request into main found');
-
-              let comparisonStatus = 'NOT_CHECKED';
-
-              if (mergedIntoMain) {
-                try {
-                  const comparison = await github.rest.repos.compareCommitsWithBasehead({
-                    owner,
-                    repo,
-                    basehead: `${baseBranch}...${name}`
-                  });
-
-                  if (comparison.data.ahead_by > 0) {
-                    comparisonStatus = 'REVIEW_REQUIRED';
-                    reasons.push('Branch has commits not found in main');
-                  } else {
-                    comparisonStatus = 'PASSED';
-                  }
-                } catch (error) {
-                  comparisonStatus = 'ERROR';
-                  reasons.push('Could not compare branch with main');
-                  core.warning(`Comparison failed for ${name}: ${error.message}`);
-                }
-              }
-
-              const basicChecksPassed = reasons.length === 0;
-
-              report.push({
-                branch: name,
-                sha: branch.commit.sha,
-                lastCommit: commitDate || 'Unknown',
-                ageDays: ageDays ?? 'Unknown',
-                protected: branch.protected,
-                mergedIntoMain,
-                openPRCount: openPRs.length,
-                comparisonStatus,
-                basicChecks: basicChecksPassed ? 'PASSED' : 'EXCLUDED',
-                deploymentVerification: 'NOT_CHECKED',
-                deletionStatus: 'NOT_ATTEMPTED',
-                result: basicChecksPassed
-                  ? 'BASIC_CHECKS_PASSED_PENDING_DEPLOYMENT_VERIFICATION'
-                  : 'NOT_ELIGIBLE',
-                reasons: reasons.join('; ') || 'Basic checks passed'
-              });
-            }
-
-            const payload = {
-              generatedAt: new Date().toISOString(),
-              owner,
-              repo,
-              baseBranch,
-              retentionDays,
-              totalBranches: report.length,
-              basicChecksPassedCount: report.filter(x => x.basicChecks === 'PASSED').length,
-              excludedCount: report.filter(x => x.basicChecks === 'EXCLUDED').length,
-              branches: report
-            };
-
-            fs.writeFileSync('branch-report-data.json', JSON.stringify(payload, null, 2));
-            core.setOutput('candidate_count', String(payload.basicChecksPassedCount));
-            core.info(`Feature branches scanned: ${payload.totalBranches}`);
-            core.info(`Passed basic checks: ${payload.basicChecksPassedCount}`);
-            core.info(`Excluded branches: ${payload.excludedCount}`);
-            core.info('Phase 1 completed. No branches were deleted.');
-
-      - name: Upload discovery data
+      - name: Upload discovery data and report
         uses: actions/upload-artifact@v4
         with:
-          name: branch-discovery-data
-          path: branch-report-data.json
+          name: branch-discovery
+          path: |
+            branch-report-data.json
+            branch-discovery-report.html
           if-no-files-found: error
           retention-days: 90
 
   # =====================================================
-  # PHASE 2: APPROVAL AND CONTROLLED CLEANUP
+  # PHASE 2: DEVOPS APPROVAL + CLEANUP
+  # Needs required reviewers on the branch-cleanup-approval
+  # environment (Settings > Environments). Without reviewers
+  # this job starts immediately.
   # =====================================================
-  cleanup_branches:
-    name: Phase 2 - Approved Branch Cleanup
-    needs: discover_candidates
+  cleanup:
+    name: Phase 2 - Approved cleanup
+    needs: discover
     if: >-
-      github.event_name == 'workflow_dispatch' &&
-      inputs.run_cleanup == true &&
-      needs.discover_candidates.result == 'success'
+      needs.discover.outputs.candidate_count != '0' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && inputs.request_cleanup))
     runs-on: ubuntu-latest
 
-    # Add required reviewers to this GitHub Environment.
     environment:
-      name: "branch-cleanup-approval"
+      name: branch-cleanup-approval
 
     permissions:
       contents: write
       pull-requests: read
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Download discovery data
         uses: actions/download-artifact@v4
         with:
-          name: branch-discovery-data
+          name: branch-discovery
           path: cleanup-input
 
-      - name: Recheck and delete eligible branches
+      - name: Re-validate and delete approved branches
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const baseBranch = 'main';
-            const cutoff = Date.now() - 30 * 86400000;
-
-            const payload = JSON.parse(
-              fs.readFileSync('cleanup-input/branch-report-data.json', 'utf8')
-            );
-            const results = [];
-
-            for (const candidate of payload.branches) {
-              if (candidate.basicChecks !== 'PASSED') {
-                results.push({
-                  branch: candidate.branch,
-                  status: 'SKIPPED',
-                  reason: 'Phase 1 basic checks did not pass'
-                });
-                continue;
-              }
-
-              // Deliberately blocks deletion until real TEST, PREPROD and PROD
-              // deployment evidence is integrated into Phase 1.
-              if (candidate.deploymentVerification !== 'VERIFIED') {
-                results.push({
-                  branch: candidate.branch,
-                  status: 'SKIPPED',
-                  reason: 'Deployment verification is NOT_CHECKED'
-                });
-                continue;
-              }
-
-              try {
-                const branchResponse = await github.rest.repos.getBranch({
-                  owner,
-                  repo,
-                  branch: candidate.branch
-                });
-                const branch = branchResponse.data;
-
-                if (branch.commit.sha !== candidate.sha) {
-                  throw new Error('Branch changed after discovery');
-                }
-                if (branch.protected) throw new Error('Branch is protected');
-
-                const commitDetails = await github.rest.repos.getCommit({
-                  owner,
-                  repo,
-                  ref: branch.commit.sha
-                });
-                const commitDate =
-                  commitDetails.data.commit.committer?.date ||
-                  commitDetails.data.commit.author?.date;
-
-                if (!commitDate || new Date(commitDate).getTime() > cutoff) {
-                  throw new Error('Branch no longer meets the 30-day age rule');
-                }
-
-                const prs = await github.paginate(github.rest.pulls.list, {
-                  owner,
-                  repo,
-                  state: 'all',
-                  head: `${owner}:${candidate.branch}`,
-                  per_page: 100
-                });
-
-                if (prs.some(pr => pr.state === 'open')) {
-                  throw new Error('An open pull request exists');
-                }
-                if (!prs.some(pr => pr.merged_at && pr.base.ref === baseBranch)) {
-                  throw new Error('No merged PR into main found');
-                }
-
-                const comparison = await github.rest.repos.compareCommitsWithBasehead({
-                  owner,
-                  repo,
-                  basehead: `${baseBranch}...${candidate.branch}`
-                });
-
-                if (comparison.data.ahead_by > 0) {
-                  throw new Error('Branch contains commits not found in main');
-                }
-
-                await github.rest.git.deleteRef({
-                  owner,
-                  repo,
-                  ref: `heads/${candidate.branch}`
-                });
-
-                results.push({
-                  branch: candidate.branch,
-                  status: 'DELETED',
-                  reason: 'All required checks passed'
-                });
-              } catch (error) {
-                results.push({
-                  branch: candidate.branch,
-                  status: 'SKIPPED_OR_FAILED',
-                  reason: error.message
-                });
-                core.warning(`Cleanup not completed for ${candidate.branch}: ${error.message}`);
-              }
-            }
-
-            fs.writeFileSync(
-              'cleanup-results.json',
-              JSON.stringify({
-                generatedAt: new Date().toISOString(),
-                results
-              }, null, 2)
-            );
-            core.info(`Cleanup results recorded: ${results.length}`);
+            await require('./scripts/branch-cleanup-lib.js')
+              .cleanup({ github, context, core });
 
       - name: Upload cleanup results
         if: always()
@@ -333,14 +120,15 @@ jobs:
           retention-days: 90
 
   # =====================================================
-  # PHASE 3: VERIFY RESULTS AND GENERATE HTML REPORT
+  # PHASE 3: CONFIRM DELETIONS + FINAL HTML REPORT
   # =====================================================
-  verify_and_report:
-    name: Phase 3 - Verify and Generate HTML Report
-    needs:
-      - discover_candidates
-      - cleanup_branches
-    if: always() && needs.discover_candidates.result == 'success'
+  final_report:
+    name: Phase 3 - Verify and final report
+    needs: [discover, cleanup]
+    if: >-
+      always() &&
+      needs.discover.result == 'success' &&
+      needs.cleanup.result != 'skipped'
     runs-on: ubuntu-latest
 
     steps:
@@ -350,93 +138,36 @@ jobs:
       - name: Download discovery data
         uses: actions/download-artifact@v4
         with:
-          name: branch-discovery-data
+          name: branch-discovery
           path: report-input
 
-      - name: Download cleanup results if available
+      # Missing if the approval was rejected, so this must not fail the job.
+      - name: Download cleanup results
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: branch-cleanup-results
           path: cleanup-input
 
-      - name: Verify branch deletion status and prepare report data
-        shell: bash
-        run: |
-          node <<'NODE'
-          const fs = require('fs');
+      - name: Confirm deleted branches are really gone
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await require('./scripts/branch-cleanup-lib.js')
+              .verifyDeletions({ github, context, core });
 
-          const payload = JSON.parse(
-            fs.readFileSync('report-input/branch-report-data.json', 'utf8')
-          );
-          const cleanupPath = 'cleanup-input/cleanup-results.json';
-          let cleanupResults = [];
+      - name: Build final HTML report
+        run: >-
+          node scripts/render-report.js final
+          report-input/branch-report-data.json
+          scripts/branch-cleanup-final-report.html
+          branch-cleanup-final-report.html
+          cleanup-input/cleanup-results.json
 
-          if (fs.existsSync(cleanupPath)) {
-            const cleanupData = JSON.parse(fs.readFileSync(cleanupPath, 'utf8'));
-            cleanupResults = cleanupData.results || [];
-          }
-
-          const resultMap = new Map(
-            cleanupResults.map(item => [item.branch, item])
-          );
-
-          for (const branch of payload.branches) {
-            const cleanup = resultMap.get(branch.branch);
-
-            if (cleanup) {
-              branch.deletionStatus = cleanup.status;
-              branch.deletionReason = cleanup.reason;
-            } else {
-              branch.deletionStatus = 'NOT_ATTEMPTED';
-              branch.deletionReason =
-                'Cleanup was not requested or did not produce a result';
-            }
-          }
-
-          payload.cleanupResults = cleanupResults;
-          payload.reportGeneratedAt = new Date().toISOString();
-
-          fs.writeFileSync(
-            'final-report-data.json',
-            JSON.stringify(payload, null, 2)
-          );
-          console.log('Final report data prepared.');
-          NODE
-
-      - name: Generate HTML report from repository template
-        shell: bash
-        run: |
-          node <<'NODE'
-          const fs = require('fs');
-
-          const dataPath = 'final-report-data.json';
-          const templatePath = 'scripts/branch-discovery-template.html';
-          const outputPath = 'branch-cleanup-final-report.html';
-          const placeholder = '__REPORT_DATA_JSON__';
-
-          if (!fs.existsSync(templatePath)) {
-            throw new Error(`HTML template not found: ${templatePath}`);
-          }
-
-          const data = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
-          const template = fs.readFileSync(templatePath, 'utf8');
-
-          if (!template.includes(placeholder)) {
-            throw new Error(`Template is missing ${placeholder}`);
-          }
-
-          const safeJson = JSON.stringify(data).replace(/</g, '\\u003c');
-          const html = template.replace(placeholder, safeJson);
-
-          fs.writeFileSync(outputPath, html, 'utf8');
-          console.log(`Generated ${outputPath}`);
-          NODE
-
-      - name: Upload final HTML report
+      - name: Upload final report
         uses: actions/upload-artifact@v4
         with:
-          name: dbt-branch-cleanup-final-report
+          name: branch-cleanup-final
           path: branch-cleanup-final-report.html
           if-no-files-found: error
           retention-days: 90
